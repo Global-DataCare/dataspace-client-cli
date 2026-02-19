@@ -1,0 +1,22 @@
+{
+  "name": "dataspace-client-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Public onboarding CLI for DataSpace organizations",
+  "bin": {
+    "client-cli": "./bin/client-cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node ./bin/client-cli.js",
+    "check": "node --check ./bin/client-cli.js"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "bs58": "^6.0.0",
+    "jose": "^5.9.6"
+  }
+}

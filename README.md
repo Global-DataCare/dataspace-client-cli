@@ -43,8 +43,10 @@ Compatibilidad objetivo (pendiente de implementación en este CLI):
 
 - Formato: `<log2N>:<r>:<p>:<dkLen>`
 - Default: `17:8:1:48` (N = 2^17 = 131072)
-- Scopes soportados (`--sector`):
-  `health-care:reader`, `health-care:provider`, `health-tech:provider`, `health-research:provider`, `health-research:reader`, `animal-care:reader`, `animal-care:provider`, `animal-research:provider`, `animal-research:reader`, `health-insurance:provider`, `health-insurance:reader`, `vet-insurance:provider`, `vet-insurance:reader`
+- Formato de scope (`--sector`):
+  `<service-category>:<membership-profile>`, por ejemplo
+  `health-care:provider` o `animal-research:reader`. Una categoría sin perfil
+  utiliza `provider`; las allowlists concretas pertenecen al despliegue.
 
 ## Flujo de comandos
 

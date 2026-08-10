@@ -18,22 +18,9 @@ import { p384 } from '@noble/curves/nist.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import bs58 from 'bs58';
 import { importJWK, SignJWT } from 'jose';
-
-const SUPPORTED_SCOPES = [
-  'health-care:reader',
-  'health-care:provider',
-  'health-tech:provider',
-  'health-research:provider',
-  'health-research:reader',
-  'animal-care:reader',
-  'animal-care:provider',
-  'animal-research:provider',
-  'animal-research:reader',
-  'health-insurance:provider',
-  'health-insurance:reader',
-  'vet-insurance:provider',
-  'vet-insurance:reader',
-];
+import { normalizeDataspaceMembershipScope } from 'gdc-common-utils-ts/utils/dataspace-membership-scope';
+import { parseScryptDerivationProfile } from 'gdc-common-utils-ts/utils/deterministic-seed-key';
+import { computeRfc7638JwkThumbprint } from 'gdc-common-utils-ts/utils/jwk-thumbprint';
 
 function printHelp() {
   console.log(`
@@ -104,7 +91,8 @@ Usage:
     [--repo <path>]
 
 Notes:
-  - supported scopes (--sector): ${SUPPORTED_SCOPES.join(', ')}
+  - --sector uses the extensible <service-category>:<membership-profile> format.
+  - a category without profile defaults to :provider.
   - current key suite in org:init-service: ES-384 + ES256K (secp256k1) for JWKS/DID.
   - CSR/X.509 remains ES-384 (P-384 key).
   - Pontus-X derivation command: org:derive-pontusx (re-derive ES256K/secp256k1).
@@ -180,23 +168,13 @@ function normalizeSaltHex(rawSalt) {
 }
 
 function normalizeSector(rawSector) {
-  const scope = rawSector.trim().toLowerCase();
-  if (SUPPORTED_SCOPES.includes(scope)) {
-    return scope;
-  }
-  if (!scope.includes(':')) {
-    const providerDefault = `${scope}:provider`;
-    if (SUPPORTED_SCOPES.includes(providerDefault)) {
-      return providerDefault;
-    }
-  }
-  throw new Error(`Invalid sector/scope "${rawSector}". Supported: ${SUPPORTED_SCOPES.join(', ')}`);
+  return normalizeDataspaceMembershipScope(rawSector);
 }
 
 function requireSector(args) {
   const rawSector = args.sector || args.category;
   if (typeof rawSector !== 'string' || !rawSector.trim()) {
-    throw new Error(`Missing required argument --sector (or --category). Supported: ${SUPPORTED_SCOPES.join(', ')}`);
+    throw new Error('Missing required argument --sector (or --category). Expected <service-category>:<membership-profile>.');
   }
   return normalizeSector(rawSector);
 }
@@ -207,23 +185,7 @@ function bigintToBytes(value, byteLength) {
 }
 
 function parseScryptProfile(raw) {
-  const profile = (raw || '17:8:1:48').trim();
-  const parts = profile.split(':').map((p) => Number.parseInt(p, 10));
-  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n) || n <= 0)) {
-    throw new Error('Invalid scrypt profile. Expected format <log2N>:<r>:<p>:<dkLen>, e.g. 17:8:1:48.');
-  }
-  const [log2N, r, p, dkLen] = parts;
-  if (log2N < 10 || log2N > 24) {
-    throw new Error('scrypt log2N must be between 10 and 24.');
-  }
-  return {
-    profile,
-    log2N,
-    N: 2 ** log2N,
-    r,
-    p,
-    dkLen,
-  };
+  return parseScryptDerivationProfile(raw, '17:8:1:48');
 }
 
 function buildDidWeb(domain) {
@@ -304,9 +266,7 @@ function deriveDeterministicP384Key(passkey, saltHex, scryptProfile) {
     x,
     y,
   };
-  const kid = createHash('sha256')
-    .update(JSON.stringify({ crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y }))
-    .digest('base64url');
+  const kid = computeRfc7638JwkThumbprint(publicJwk);
 
   return {
     privateJwk,
@@ -355,9 +315,7 @@ function deriveDeterministicSecp256k1Key(passkey, saltHex, scryptProfile) {
     x,
     y,
   };
-  const kid = createHash('sha256')
-    .update(JSON.stringify({ crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y }))
-    .digest('base64url');
+  const kid = computeRfc7638JwkThumbprint(publicJwk);
 
   return {
     privateJwk,

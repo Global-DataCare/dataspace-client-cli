@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -18,16 +18,9 @@ import { p384 } from '@noble/curves/nist.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import bs58 from 'bs58';
 import { importJWK, SignJWT } from 'jose';
-
-const SUPPORTED_SECTORS = [
-  'health-care',
-  'health-tech',
-  'animal-care',
-  'animal-breed',
-  'onehealth-research',
-  'health-research',
-  'vet-research',
-];
+import { normalizeDataspaceMembershipScope } from 'gdc-common-utils-ts/utils/dataspace-membership-scope';
+import { parseScryptDerivationProfile } from 'gdc-common-utils-ts/utils/deterministic-seed-key';
+import { computeRfc7638JwkThumbprint } from 'gdc-common-utils-ts/utils/jwk-thumbprint';
 
 function printHelp() {
   console.log(`
@@ -41,7 +34,7 @@ Usage:
     --legal-name "<legal name>" \
     --tax-id <id> \
     --country <ISO2> \
-    --sector <sector> \
+    --sector <scope> \
     [--terms-url <https-url>] \
     [--scrypt 17:8:1:48] \
     --passkey <secret> \
@@ -76,6 +69,7 @@ Usage:
     [--scrypt 17:8:1:48] \
     --passkey <secret> \
     [--salt <hex>] \
+    [--replace-pontusx] \
     [--repo <path>]
 
   client-cli vp:sign \
@@ -91,19 +85,24 @@ Usage:
   client-cli submission:pack \
     --request-id <id> \
     --ica-domain <ica-domain> \
+    [--domain <subdomain.globaldatacare.es>] \
     [--terms-pdf <signed-pdf>] \
     [--out <bundle.tgz>] \
     [--repo <path>]
 
 Notes:
-  - supported sectors: ${SUPPORTED_SECTORS.join(', ')}
-  - current key suite: ES-384 (ECDSA P-384 / secp384r1) for JWKS, DID and CSR.
-  - Pontus-X derivation command: org:derive-pontusx (ES256K/secp256k1).
+  - --sector uses the extensible <service-category>:<membership-profile> format.
+  - a category without profile defaults to :provider.
+  - current key suite in org:init-service: ES-384 + ES256K (secp256k1) for JWKS/DID.
+  - CSR/X.509 remains ES-384 (P-384 key).
+  - Pontus-X derivation command: org:derive-pontusx (re-derive ES256K/secp256k1).
+  - use --replace-pontusx for ES256K rotation (replace prior Pontus-X key refs).
   - target compatibility (not generated yet in this CLI): ML-DSA, ML-KEM.
   - scrypt profile format: <log2N>:<r>:<p>:<dkLen>
   - default scrypt profile: 17:8:1:48  => N = 2^17 = 131072
   - org:init-service and org:add-controller always auto-generate salt.
   - passkey/salt are used together only in recover commands.
+  - output root by domain: output/did_web_<domain>/
   - passkey/salt can be placed at the end of command.
 `);
 }
@@ -169,17 +168,13 @@ function normalizeSaltHex(rawSalt) {
 }
 
 function normalizeSector(rawSector) {
-  const sector = rawSector.trim().toLowerCase();
-  if (!SUPPORTED_SECTORS.includes(sector)) {
-    throw new Error(`Invalid sector "${rawSector}". Supported: ${SUPPORTED_SECTORS.join(', ')}`);
-  }
-  return sector;
+  return normalizeDataspaceMembershipScope(rawSector);
 }
 
 function requireSector(args) {
   const rawSector = args.sector || args.category;
   if (typeof rawSector !== 'string' || !rawSector.trim()) {
-    throw new Error(`Missing required argument --sector (or --category). Supported: ${SUPPORTED_SECTORS.join(', ')}`);
+    throw new Error('Missing required argument --sector (or --category). Expected <service-category>:<membership-profile>.');
   }
   return normalizeSector(rawSector);
 }
@@ -190,23 +185,7 @@ function bigintToBytes(value, byteLength) {
 }
 
 function parseScryptProfile(raw) {
-  const profile = (raw || '17:8:1:48').trim();
-  const parts = profile.split(':').map((p) => Number.parseInt(p, 10));
-  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n) || n <= 0)) {
-    throw new Error('Invalid scrypt profile. Expected format <log2N>:<r>:<p>:<dkLen>, e.g. 17:8:1:48.');
-  }
-  const [log2N, r, p, dkLen] = parts;
-  if (log2N < 10 || log2N > 24) {
-    throw new Error('scrypt log2N must be between 10 and 24.');
-  }
-  return {
-    profile,
-    log2N,
-    N: 2 ** log2N,
-    r,
-    p,
-    dkLen,
-  };
+  return parseScryptDerivationProfile(raw, '17:8:1:48');
 }
 
 function buildDidWeb(domain) {
@@ -227,6 +206,33 @@ function getEmployeeIds(domain, email, roleIsco) {
     employeePublicId,
     employeeDid,
   };
+}
+
+function toDidWebFolderName(domain) {
+  return `did_web_${domain.replace(/[^a-z0-9._-]/g, '_')}`;
+}
+
+function resolveOrgOutputRoot(repoRoot, domain) {
+  return path.join(repoRoot, 'output', toDidWebFolderName(domain));
+}
+
+function resolveOrgOutputRootForPack(repoRoot, args) {
+  if (typeof args.domain === 'string' && args.domain.trim()) {
+    return resolveOrgOutputRoot(repoRoot, normalizeDomain(args.domain));
+  }
+  const outputRoot = path.join(repoRoot, 'output');
+  if (!existsSync(outputRoot)) {
+    throw new Error('Missing output directory. Provide --domain or run org:init-service first.');
+  }
+  const candidates = readdirSync(outputRoot)
+    .filter((entry) => entry.startsWith('did_web_'))
+    .map((entry) => path.join(outputRoot, entry))
+    .filter((entryPath) => statSync(entryPath).isDirectory());
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 0) {
+    throw new Error('No did_web_* outputs found. Provide --domain or run org:init-service first.');
+  }
+  throw new Error('Multiple did_web_* outputs found. Use --domain to select one.');
 }
 
 function deriveDeterministicP384Key(passkey, saltHex, scryptProfile) {
@@ -260,9 +266,7 @@ function deriveDeterministicP384Key(passkey, saltHex, scryptProfile) {
     x,
     y,
   };
-  const kid = createHash('sha256')
-    .update(JSON.stringify({ crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y }))
-    .digest('base64url');
+  const kid = computeRfc7638JwkThumbprint(publicJwk);
 
   return {
     privateJwk,
@@ -311,9 +315,7 @@ function deriveDeterministicSecp256k1Key(passkey, saltHex, scryptProfile) {
     x,
     y,
   };
-  const kid = createHash('sha256')
-    .update(JSON.stringify({ crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y }))
-    .digest('base64url');
+  const kid = computeRfc7638JwkThumbprint(publicJwk);
 
   return {
     privateJwk,
@@ -364,8 +366,18 @@ function runOpenSsl(args, options = {}) {
   }
 }
 
+function scopeToPathSegment(scope) {
+  return scope.replace(':', '/');
+}
+
+function scopeToIdSuffix(scope) {
+  return scope.replace(/[^a-z0-9_-]/g, '-');
+}
+
 function buildOrgDidDocument(domain, serviceJwk, sector, extra = {}) {
   const orgDid = buildDidWeb(domain);
+  const scopePath = scopeToPathSegment(sector);
+  const scopeId = scopeToIdSuffix(sector);
   return {
     '@context': ['https://www.w3.org/ns/did/v1'],
     id: orgDid,
@@ -394,9 +406,9 @@ function buildOrgDidDocument(domain, serviceJwk, sector, extra = {}) {
         serviceEndpoint: `https://${domain}/dsp`,
       },
       {
-        id: `${orgDid}#dsp-${sector}`,
+        id: `${orgDid}#dsp-${scopeId}`,
         type: 'DataSpaceProtocolService',
-        serviceEndpoint: `https://${domain}/dsp/${sector}`,
+        serviceEndpoint: `https://${domain}/dsp/${scopePath}`,
       },
     ],
   };
@@ -513,33 +525,68 @@ async function createEmployeeVc({
 async function cmdDomainPrecheck(args) {
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
-  let records = [];
-  let free = false;
-  let errorCode = null;
-  let errorMessage = null;
+  const orgRoot = resolveOrgOutputRoot(repoRoot, domain);
+  const notFoundCodes = new Set(['ENOTFOUND', 'ENODATA', 'EAI_NONAME', 'EAI_NODATA', 'NXDOMAIN', 'NOTFOUND']);
+  const queryErrors = [];
+  const queryRecords = {};
 
-  try {
-    records = await dns.resolveAny(domain);
-    free = records.length === 0;
-  } catch (error) {
-    errorCode = error?.code || 'UNKNOWN';
-    errorMessage = error?.message || 'DNS query error';
-    free = ['ENOTFOUND', 'ENODATA', 'SERVFAIL', 'NXDOMAIN'].includes(errorCode);
+  async function runQuery(label, queryFn) {
+    try {
+      const value = await queryFn();
+      if (Array.isArray(value) && value.length > 0) {
+        queryRecords[label] = value;
+      } else if (value && !Array.isArray(value)) {
+        queryRecords[label] = value;
+      }
+      return { label, ok: true, code: null };
+    } catch (error) {
+      const code = error?.code || 'UNKNOWN';
+      const message = error?.message || 'DNS query error';
+      queryErrors.push({ label, code, message });
+      return { label, ok: false, code };
+    }
   }
+
+  const checks = await Promise.all([
+    runQuery('lookup', () => dns.lookup(domain, { all: true })),
+    runQuery('A', () => dns.resolve4(domain)),
+    runQuery('AAAA', () => dns.resolve6(domain)),
+    runQuery('CNAME', () => dns.resolveCname(domain)),
+    runQuery('MX', () => dns.resolveMx(domain)),
+    runQuery('NS', () => dns.resolveNs(domain)),
+    runQuery('TXT', () => dns.resolveTxt(domain)),
+  ]);
+
+  const hasAnyRecords = Object.keys(queryRecords).length > 0;
+  const nonNotFoundErrors = queryErrors.filter((err) => !notFoundCodes.has(err.code));
+
+  // "free" is true only when all checks consistently return not-found/nodata.
+  // Any positive record or ambiguous error means "not free / unknown" to avoid false positives.
+  const free = !hasAnyRecords && queryErrors.length > 0 && nonNotFoundErrors.length === 0;
 
   const result = {
     domain,
     checkedAt: new Date().toISOString(),
-    dnsRecords: records,
+    dnsRecords: queryRecords,
     isLikelyFree: free,
-    dnsError: errorCode ? { code: errorCode, message: errorMessage } : null,
+    queryResults: checks,
+    dnsErrors: queryErrors,
+    confidence: hasAnyRecords ? 'high-in-use' : (free ? 'medium-free' : 'low-ambiguous'),
   };
 
-  const outPath = path.join(repoRoot, 'onboarding', 'state', 'domain-precheck.json');
+  const outPath = path.join(orgRoot, 'onboarding', 'state', 'domain-precheck.json');
   writeJson(outPath, result);
 
   console.log(`Wrote ${path.relative(repoRoot, outPath)}`);
-  console.log(free ? `Domain appears free: ${domain}` : `Domain appears in use or reserved: ${domain}`);
+  if (hasAnyRecords) {
+    console.log(`Domain appears in use or reserved: ${domain}`);
+    return;
+  }
+  if (free) {
+    console.log(`Domain appears free (DNS no-data): ${domain}`);
+    return;
+  }
+  console.log(`Domain status ambiguous (not marking free): ${domain}`);
 }
 
 async function cmdOrgInitService(args) {
@@ -548,6 +595,7 @@ async function cmdOrgInitService(args) {
   }
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const legalName = requireArg(args, 'legal-name');
   const taxId = requireArg(args, 'tax-id');
   const country = requireArg(args, 'country').toUpperCase();
@@ -558,14 +606,22 @@ async function cmdOrgInitService(args) {
   const salt = randomBytes(16).toString('hex');
 
   const { privateJwk, publicJwk, kid, scrypt } = deriveDeterministicP384Key(passkey, salt, profile);
+  const {
+    privateJwk: pontusPrivateJwk,
+    publicJwk: pontusPublicJwk,
+    kid: pontusKid,
+    context: pontusContext,
+  } = deriveDeterministicSecp256k1Key(passkey, salt, profile);
   const orgDid = buildDidWeb(domain);
 
-  const privateDir = path.join(repoRoot, '.private', 'service');
-  const wellKnownDir = path.join(repoRoot, '.well-known');
-  const pkiDir = path.join(repoRoot, 'pki');
-  const stateDir = path.join(repoRoot, 'onboarding', 'state');
+  const privateDir = path.join(outputRoot, '.private', 'service');
+  const pontusPrivateDir = path.join(outputRoot, '.private', 'service-pontusx');
+  const wellKnownDir = path.join(outputRoot, '.well-known');
+  const pkiDir = path.join(outputRoot, 'pki');
+  const stateDir = path.join(outputRoot, 'onboarding', 'state');
 
   ensureDir(privateDir);
+  ensureDir(pontusPrivateDir);
   ensureDir(wellKnownDir);
   ensureDir(pkiDir);
   ensureDir(stateDir);
@@ -575,6 +631,10 @@ async function cmdOrgInitService(args) {
   const privateKeyPem = toPkcs8Pem(privateJwk);
   writeFileSync(path.join(privateDir, 'private-key.pem'), privateKeyPem);
   writeFileSync(path.join(privateDir, 'public-key.pem'), toSpkiPem(publicJwk));
+  writeJson(path.join(pontusPrivateDir, 'private.jwk.json'), pontusPrivateJwk);
+  writeJson(path.join(pontusPrivateDir, 'public.jwk.json'), pontusPublicJwk);
+  writeFileSync(path.join(pontusPrivateDir, 'private-key.pem'), toPkcs8Pem(pontusPrivateJwk));
+  writeFileSync(path.join(pontusPrivateDir, 'public-key.pem'), toSpkiPem(pontusPublicJwk));
 
   const csrPath = path.join(pkiDir, `${domain}.csr.pem`);
   runOpenSsl([
@@ -589,8 +649,20 @@ async function cmdOrgInitService(args) {
     `/CN=${sanitizeX509SubjectValue(domain)}/O=${sanitizeX509SubjectValue(legalName)}/C=${sanitizeX509SubjectValue(country)}`,
   ]);
 
-  const didDoc = buildOrgDidDocument(domain, publicJwk, sector);
-  const jwks = { keys: [publicJwk] };
+  const pontusVmId = `${orgDid}#pontusx-${pontusKid}`;
+  const didDoc = buildOrgDidDocument(domain, publicJwk, sector, {
+    verificationMethod: [
+      {
+        id: pontusVmId,
+        type: 'JsonWebKey2020',
+        controller: orgDid,
+        publicKeyJwk: pontusPublicJwk,
+      },
+    ],
+    authentication: [pontusVmId],
+    assertionMethod: [pontusVmId],
+  });
+  const jwks = { keys: [publicJwk, pontusPublicJwk] };
   const vc = await createOrganizationVc({
     domain,
     legalName,
@@ -622,6 +694,7 @@ async function cmdOrgInitService(args) {
     createdAt: new Date().toISOString(),
     did: orgDid,
     serviceKid: kid,
+    pontusKid,
     sector,
     kdf: {
       algorithm: 'scrypt',
@@ -634,9 +707,28 @@ async function cmdOrgInitService(args) {
     },
     recovery: 'Re-run org:init-service with same domain, passkey, salt and scrypt profile.',
   });
+  writeJson(path.join(stateDir, 'pontusx-kdf.json'), {
+    version: 'v1',
+    createdAt: new Date().toISOString(),
+    did: orgDid,
+    pontusKid,
+    context: pontusContext,
+    kdf: {
+      algorithm: 'scrypt',
+      profile: scrypt.profile,
+      log2N: scrypt.log2N,
+      r: scrypt.r,
+      p: scrypt.p,
+      dkLen: scrypt.dkLen,
+      salt,
+    },
+    note: 'Derived ES256K/secp256k1 key for Pontus-X compatibility and added it to .well-known/jwks.json.',
+  });
 
   console.log(`Generated service onboarding material for ${domain}`);
-  console.log(`CSR: pki/${domain}.csr.pem`);
+  console.log(`Output root: ${path.relative(repoRoot, outputRoot)}`);
+  console.log(`CSR: ${path.relative(repoRoot, csrPath)}`);
+  console.log(`JWKS keys: ES384=${kid}, ES256K=${pontusKid}`);
   console.log(`Generated salt: ${salt}`);
 }
 
@@ -646,6 +738,7 @@ async function cmdOrgAddController(args) {
   }
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const email = requireArg(args, 'email').toLowerCase();
   const roleIsco = normalizeRoleIsco(requireArg(args, 'role-isco'));
   const passkey = requireArg(args, 'passkey');
@@ -656,9 +749,9 @@ async function cmdOrgAddController(args) {
   const { internalEmployeeId, employeePublicId, employeeDid } = getEmployeeIds(domain, email, roleIsco);
   const { privateJwk, publicJwk, kid, scrypt } = deriveDeterministicP384Key(passkey, salt, profile);
 
-  const servicePrivateJwkPath = path.join(repoRoot, '.private', 'service', 'private.jwk.json');
-  const orgDidPath = path.join(repoRoot, '.well-known', 'did.json');
-  const orgJwksPath = path.join(repoRoot, '.well-known', 'jwks.json');
+  const servicePrivateJwkPath = path.join(outputRoot, '.private', 'service', 'private.jwk.json');
+  const orgDidPath = path.join(outputRoot, '.well-known', 'did.json');
+  const orgJwksPath = path.join(outputRoot, '.well-known', 'jwks.json');
   if (!existsSync(servicePrivateJwkPath) || !existsSync(orgDidPath) || !existsSync(orgJwksPath)) {
     throw new Error('Missing organization service material. Run org:init-service first.');
   }
@@ -666,12 +759,14 @@ async function cmdOrgAddController(args) {
   const orgPrivateJwk = readJson(servicePrivateJwkPath);
   const orgDidDoc = readJson(orgDidPath);
   const orgJwks = readJson(orgJwksPath);
-  const orgServiceKid = orgJwks?.keys?.[0]?.kid;
+  const orgServiceKid = Array.isArray(orgJwks?.keys)
+    ? orgJwks.keys.find((key) => key?.kty === 'EC' && key?.crv === 'P-384')?.kid
+    : null;
   if (!orgServiceKid) {
-    throw new Error('Invalid .well-known/jwks.json, missing service key kid.');
+    throw new Error('Invalid .well-known/jwks.json, missing ES384 service key kid.');
   }
 
-  const controllerPrivateDir = path.join(repoRoot, '.private', 'controllers', employeePublicId);
+  const controllerPrivateDir = path.join(outputRoot, '.private', 'controllers', employeePublicId);
   ensureDir(controllerPrivateDir);
   writeJson(path.join(controllerPrivateDir, 'private.jwk.json'), privateJwk);
   writeJson(path.join(controllerPrivateDir, 'public.jwk.json'), publicJwk);
@@ -685,7 +780,7 @@ async function cmdOrgAddController(args) {
     roleIsco,
   });
 
-  const pkiDir = path.join(repoRoot, 'pki');
+  const pkiDir = path.join(outputRoot, 'pki');
   ensureDir(pkiDir);
   const employeeCsrPath = path.join(pkiDir, `employee-${employeePublicId}.csr.pem`);
   const employeeCn = `emp-${employeePublicId}`.slice(0, 64);
@@ -729,7 +824,7 @@ async function cmdOrgAddController(args) {
     assertionMethod,
   });
 
-  const employeeDir = path.join(repoRoot, 'employee', 'multibase', employeePublicId);
+  const employeeDir = path.join(outputRoot, 'employee', 'multibase', employeePublicId);
   ensureDir(employeeDir);
   const employeeDidDoc = {
     '@context': ['https://www.w3.org/ns/did/v1'],
@@ -759,7 +854,7 @@ async function cmdOrgAddController(args) {
   });
   writeJson(path.join(employeeDir, 'vc.json'), employeeVc);
 
-  const stateDir = path.join(repoRoot, 'onboarding', 'state');
+  const stateDir = path.join(outputRoot, 'onboarding', 'state');
   ensureDir(stateDir);
   writeJson(path.join(stateDir, `controller-${employeePublicId}-kdf.json`), {
     version: 'v1',
@@ -779,25 +874,29 @@ async function cmdOrgAddController(args) {
   });
 
   console.log(`Added controller ${employeeDid}`);
-  console.log(`Employee CSR: pki/employee-${employeePublicId}.csr.pem`);
+  console.log(`Output root: ${path.relative(repoRoot, outputRoot)}`);
+  console.log(`Employee CSR: ${path.relative(repoRoot, employeeCsrPath)}`);
   console.log(`Generated salt: ${salt}`);
 }
 
 async function cmdOrgRecoverService(args) {
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const passkey = requireArg(args, 'passkey');
   const salt = normalizeSaltHex(requireArg(args, 'salt'));
   const profile = args.scrypt || '17:8:1:48';
 
-  const jwksPath = path.join(repoRoot, '.well-known', 'jwks.json');
+  const jwksPath = path.join(outputRoot, '.well-known', 'jwks.json');
   if (!existsSync(jwksPath)) {
     throw new Error('Missing .well-known/jwks.json. Cannot verify recovered service key.');
   }
   const jwks = readJson(jwksPath);
-  const existingServiceJwk = Array.isArray(jwks.keys) ? jwks.keys[0] : null;
+  const existingServiceJwk = Array.isArray(jwks.keys)
+    ? jwks.keys.find((key) => key?.kty === 'EC' && key?.crv === 'P-384')
+    : null;
   if (!existingServiceJwk) {
-    throw new Error('Invalid .well-known/jwks.json, missing service key.');
+    throw new Error('Invalid .well-known/jwks.json, missing ES384 service key.');
   }
 
   const { privateJwk, publicJwk, kid, scrypt } = deriveDeterministicP384Key(passkey, salt, profile);
@@ -805,8 +904,8 @@ async function cmdOrgRecoverService(args) {
     throw new Error('Recovered service key does not match published jwks.json key.');
   }
 
-  const privateDir = path.join(repoRoot, '.private', 'service');
-  const stateDir = path.join(repoRoot, 'onboarding', 'state');
+  const privateDir = path.join(outputRoot, '.private', 'service');
+  const stateDir = path.join(outputRoot, 'onboarding', 'state');
   ensureDir(privateDir);
   ensureDir(stateDir);
   writeJson(path.join(privateDir, 'private.jwk.json'), privateJwk);
@@ -831,11 +930,13 @@ async function cmdOrgRecoverService(args) {
   });
 
   console.log(`Recovered service private material for ${domain}`);
+  console.log(`Output root: ${path.relative(repoRoot, outputRoot)}`);
 }
 
 async function cmdOrgRecoverController(args) {
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const email = requireArg(args, 'email').toLowerCase();
   const roleIsco = normalizeRoleIsco(requireArg(args, 'role-isco'));
   const passkey = requireArg(args, 'passkey');
@@ -843,7 +944,7 @@ async function cmdOrgRecoverController(args) {
   const profile = args.scrypt || '17:8:1:48';
 
   const { internalEmployeeId, employeePublicId, employeeDid } = getEmployeeIds(domain, email, roleIsco);
-  const employeeJwksPath = path.join(repoRoot, 'employee', 'multibase', employeePublicId, 'jwks.json');
+  const employeeJwksPath = path.join(outputRoot, 'employee', 'multibase', employeePublicId, 'jwks.json');
   if (!existsSync(employeeJwksPath)) {
     throw new Error(`Missing employee jwks.json for ${employeeDid}`);
   }
@@ -858,8 +959,8 @@ async function cmdOrgRecoverController(args) {
     throw new Error('Recovered controller key does not match published employee jwks.json key.');
   }
 
-  const controllerPrivateDir = path.join(repoRoot, '.private', 'controllers', employeePublicId);
-  const stateDir = path.join(repoRoot, 'onboarding', 'state');
+  const controllerPrivateDir = path.join(outputRoot, '.private', 'controllers', employeePublicId);
+  const stateDir = path.join(outputRoot, 'onboarding', 'state');
   ensureDir(controllerPrivateDir);
   ensureDir(stateDir);
   writeJson(path.join(controllerPrivateDir, 'private.jwk.json'), privateJwk);
@@ -892,13 +993,16 @@ async function cmdOrgRecoverController(args) {
   });
 
   console.log(`Recovered controller private material for ${employeeDid}`);
+  console.log(`Output root: ${path.relative(repoRoot, outputRoot)}`);
 }
 
 async function cmdOrgDerivePontusx(args) {
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const passkey = requireArg(args, 'passkey');
-  const stateDir = path.join(repoRoot, 'onboarding', 'state');
+  const replacePontusx = Boolean(args['replace-pontusx']);
+  const stateDir = path.join(outputRoot, 'onboarding', 'state');
   const serviceKdfPath = path.join(stateDir, 'service-kdf.json');
   const serviceKdf = existsSync(serviceKdfPath) ? readJson(serviceKdfPath) : null;
 
@@ -912,7 +1016,7 @@ async function cmdOrgDerivePontusx(args) {
   const { privateJwk, publicJwk, kid, scrypt, context } = deriveDeterministicSecp256k1Key(passkey, salt, profile);
   const orgDid = buildDidWeb(domain);
 
-  const didPath = path.join(repoRoot, '.well-known', 'did.json');
+  const didPath = path.join(outputRoot, '.well-known', 'did.json');
   if (!existsSync(didPath)) {
     throw new Error('Missing .well-known/did.json. Run org:init-service first.');
   }
@@ -921,8 +1025,8 @@ async function cmdOrgDerivePontusx(args) {
     throw new Error(`Domain/DID mismatch. Expected ${orgDid}, found ${didDoc.id}`);
   }
 
-  const privateDir = path.join(repoRoot, '.private', 'service-pontusx');
-  const wellKnownDir = path.join(repoRoot, '.well-known');
+  const privateDir = path.join(outputRoot, '.private', 'service-pontusx');
+  const wellKnownDir = path.join(outputRoot, '.well-known');
   const mainJwksPath = path.join(wellKnownDir, 'jwks.json');
   ensureDir(privateDir);
   ensureDir(wellKnownDir);
@@ -937,7 +1041,10 @@ async function cmdOrgDerivePontusx(args) {
   }
   const mainJwks = readJson(mainJwksPath);
   const existingKeys = Array.isArray(mainJwks.keys) ? mainJwks.keys : [];
-  const keysWithoutCurrent = existingKeys.filter((key) => key?.kid !== publicJwk.kid);
+  const isPontusxKey = (key) => key?.kty === 'EC' && key?.crv === 'secp256k1';
+  const keysWithoutCurrent = existingKeys.filter((key) => (
+    replacePontusx ? !isPontusxKey(key) : key?.kid !== publicJwk.kid
+  ));
   keysWithoutCurrent.push(publicJwk);
   writeJson(mainJwksPath, {
     ...mainJwks,
@@ -946,7 +1053,12 @@ async function cmdOrgDerivePontusx(args) {
 
   const pontusVmId = `${orgDid}#pontusx-${kid}`;
   const currentVm = Array.isArray(didDoc.verificationMethod) ? didDoc.verificationMethod : [];
-  const vmWithoutCurrent = currentVm.filter((vm) => vm.id !== pontusVmId);
+  const vmWithoutCurrent = currentVm.filter((vm) => {
+    if (replacePontusx) {
+      return !(typeof vm?.id === 'string' && vm.id.startsWith(`${orgDid}#pontusx-`));
+    }
+    return vm?.id !== pontusVmId;
+  });
   vmWithoutCurrent.push({
     id: pontusVmId,
     type: 'JsonWebKey2020',
@@ -954,9 +1066,16 @@ async function cmdOrgDerivePontusx(args) {
     publicKeyJwk: publicJwk,
   });
 
-  const authentication = Array.isArray(didDoc.authentication) ? didDoc.authentication : [];
+  const authBase = Array.isArray(didDoc.authentication) ? didDoc.authentication : [];
+  const authentication = replacePontusx
+    ? authBase.filter((entry) => !(typeof entry === 'string' && entry.startsWith(`${orgDid}#pontusx-`)))
+    : authBase;
   if (!authentication.includes(pontusVmId)) authentication.push(pontusVmId);
-  const assertionMethod = Array.isArray(didDoc.assertionMethod) ? didDoc.assertionMethod : [];
+
+  const assertionBase = Array.isArray(didDoc.assertionMethod) ? didDoc.assertionMethod : [];
+  const assertionMethod = replacePontusx
+    ? assertionBase.filter((entry) => !(typeof entry === 'string' && entry.startsWith(`${orgDid}#pontusx-`)))
+    : assertionBase;
   if (!assertionMethod.includes(pontusVmId)) assertionMethod.push(pontusVmId);
 
   const service = Array.isArray(didDoc.service) ? didDoc.service : [];
@@ -975,6 +1094,7 @@ async function cmdOrgDerivePontusx(args) {
     createdAt: new Date().toISOString(),
     did: orgDid,
     pontusKid: kid,
+    replacePontusx,
     context,
     kdf: {
       algorithm: 'scrypt',
@@ -985,19 +1105,24 @@ async function cmdOrgDerivePontusx(args) {
       dkLen: scrypt.dkLen,
       salt,
     },
-    note: 'Derived ES256K/secp256k1 key for Pontus-X compatibility and added it to .well-known/jwks.json.',
+    note: replacePontusx
+      ? 'Rotated ES256K/secp256k1 Pontus-X key and replaced prior Pontus-X references in jwks/did.'
+      : 'Derived ES256K/secp256k1 key for Pontus-X compatibility and added it to .well-known/jwks.json.',
   });
 
   console.log(`Derived Pontus-X key profile for ${orgDid}`);
-  console.log(`JWKS updated: .well-known/jwks.json`);
+  console.log(`Pontus-X mode: ${replacePontusx ? 'rotation (replace)' : 'additive (append/update-by-kid)'}`);
+  console.log(`Output root: ${path.relative(repoRoot, outputRoot)}`);
+  console.log(`JWKS updated: ${path.relative(repoRoot, mainJwksPath)}`);
   if (!args.salt) {
-    console.log(`Salt source: onboarding/state/service-kdf.json`);
+    console.log(`Salt source: ${path.relative(repoRoot, serviceKdfPath)}`);
   }
 }
 
 async function cmdVpSign(args) {
   const repoRoot = path.resolve(args.repo || '.');
   const domain = normalizeDomain(requireArg(args, 'domain'));
+  const outputRoot = resolveOrgOutputRoot(repoRoot, domain);
   const email = requireArg(args, 'email').toLowerCase();
   const roleIsco = normalizeRoleIsco(requireArg(args, 'role-isco'));
   const aud = requireArg(args, 'aud');
@@ -1008,9 +1133,9 @@ async function cmdVpSign(args) {
   }
 
   const { employeePublicId, employeeDid } = getEmployeeIds(domain, email, roleIsco);
-  const controllerPrivatePath = path.join(repoRoot, '.private', 'controllers', employeePublicId, 'private.jwk.json');
-  const controllerPublicPath = path.join(repoRoot, '.private', 'controllers', employeePublicId, 'public.jwk.json');
-  const employeeVcPath = path.join(repoRoot, 'employee', 'multibase', employeePublicId, 'vc.json');
+  const controllerPrivatePath = path.join(outputRoot, '.private', 'controllers', employeePublicId, 'private.jwk.json');
+  const controllerPublicPath = path.join(outputRoot, '.private', 'controllers', employeePublicId, 'public.jwk.json');
+  const employeeVcPath = path.join(outputRoot, 'employee', 'multibase', employeePublicId, 'vc.json');
   if (!existsSync(controllerPrivatePath) || !existsSync(controllerPublicPath) || !existsSync(employeeVcPath)) {
     throw new Error('Missing controller material. Run org:add-controller first.');
   }
@@ -1041,8 +1166,8 @@ async function cmdVpSign(args) {
     .setExpirationTime(`${expSeconds}s`)
     .sign(key);
 
-  const defaultOut = path.join(repoRoot, '.private', 'controllers', employeePublicId, 'vp-token.jwt');
-  const outPath = path.resolve(repoRoot, args.out || defaultOut);
+  const defaultOut = path.join(outputRoot, '.private', 'controllers', employeePublicId, 'vp-token.jwt');
+  const outPath = args.out ? path.resolve(repoRoot, args.out) : defaultOut;
   ensureDir(path.dirname(outPath));
   writeFileSync(outPath, `${token}${os.EOL}`);
   console.log(`Wrote VP token: ${outPath}`);
@@ -1050,11 +1175,14 @@ async function cmdVpSign(args) {
 
 async function cmdSubmissionPack(args) {
   const repoRoot = path.resolve(args.repo || '.');
+  const orgRoot = resolveOrgOutputRootForPack(repoRoot, args);
   const requestId = requireArg(args, 'request-id');
   const icaDomain = normalizeDomain(requireArg(args, 'ica-domain'));
-  const outPath = path.resolve(repoRoot, args.out || `submission-${requestId}.tgz`);
-  const termsPdf = args['terms-pdf'] ? path.resolve(args['terms-pdf']) : null;
-  const evidenceDir = path.join(repoRoot, 'evidence');
+  const outPath = args.out
+    ? path.resolve(repoRoot, args.out)
+    : path.join(orgRoot, `submission-${requestId}.tgz`);
+  const termsPdf = args['terms-pdf'] ? path.resolve(repoRoot, args['terms-pdf']) : null;
+  const evidenceDir = path.join(orgRoot, 'evidence');
   ensureDir(evidenceDir);
 
   if (termsPdf) {
@@ -1064,17 +1192,17 @@ async function cmdSubmissionPack(args) {
     writeFileSync(path.join(evidenceDir, 'terms-fnmt-signed.pdf'), readFileSync(termsPdf));
   }
 
-  const didPath = path.join(repoRoot, '.well-known', 'did.json');
-  const jwksPath = path.join(repoRoot, '.well-known', 'jwks.json');
-  const vcPath = path.join(repoRoot, '.well-known', 'vc.json');
-  const pkiDir = path.join(repoRoot, 'pki');
+  const didPath = path.join(orgRoot, '.well-known', 'did.json');
+  const jwksPath = path.join(orgRoot, '.well-known', 'jwks.json');
+  const vcPath = path.join(orgRoot, '.well-known', 'vc.json');
+  const pkiDir = path.join(orgRoot, 'pki');
 
   if (!existsSync(didPath) || !existsSync(jwksPath) || !existsSync(vcPath) || !existsSync(pkiDir)) {
     throw new Error('Missing onboarding public artifacts. Run org:init-service first.');
   }
 
   const didDoc = readJson(didPath);
-  const orgProfilePath = path.join(repoRoot, 'onboarding', 'state', 'organization-profile.json');
+  const orgProfilePath = path.join(orgRoot, 'onboarding', 'state', 'organization-profile.json');
   const orgProfile = existsSync(orgProfilePath) ? readJson(orgProfilePath) : null;
   const manifest = {
     schema: 'gdc-onboarding-submission-v1',
@@ -1091,16 +1219,16 @@ async function cmdSubmissionPack(args) {
       'evidence/terms-fnmt-signed.pdf (optional)',
     ],
   };
-  const manifestPath = path.join(repoRoot, 'onboarding', 'state', `submission-${requestId}.json`);
+  const manifestPath = path.join(orgRoot, 'onboarding', 'state', `submission-${requestId}.json`);
   writeJson(manifestPath, manifest);
 
   const includeEntries = ['.well-known', 'pki', 'employee', 'onboarding/state'];
-  if (existsSync(path.join(repoRoot, 'evidence', 'terms-fnmt-signed.pdf'))) {
+  if (existsSync(path.join(orgRoot, 'evidence', 'terms-fnmt-signed.pdf'))) {
     includeEntries.push('evidence/terms-fnmt-signed.pdf');
   }
 
   try {
-    execFileSync('tar', ['-czf', outPath, ...includeEntries], { cwd: repoRoot, stdio: 'pipe' });
+    execFileSync('tar', ['-czf', outPath, ...includeEntries], { cwd: orgRoot, stdio: 'pipe' });
   } catch (error) {
     const stderr = error?.stderr?.toString?.() || error?.message || 'unknown error';
     throw new Error(`tar failed: ${stderr}`);

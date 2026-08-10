@@ -12,11 +12,13 @@
   },
   "scripts": {
     "start": "node ./bin/client-cli.js",
-    "check": "node --check ./bin/client-cli.js"
+    "check": "node --check ./bin/client-cli.js",
+    "test": "node --test ./test/*.test.js"
   },
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "bs58": "^6.0.0",
+    "gdc-common-utils-ts": "^2.3.29",
     "jose": "^5.9.6"
   }
 }

@@ -2,6 +2,9 @@
 
 CLI público para onboarding de organizaciones en producción.
 
+Las reglas de alcance, custodia, autoridad y validación están enlazadas desde
+[`docs/RULES_INDEX.md`](docs/RULES_INDEX.md).
+
 Todos los artefactos generados por el CLI se escriben bajo:
 - `output/did_web_<subdomain>.globaldatacare.es/`
 
